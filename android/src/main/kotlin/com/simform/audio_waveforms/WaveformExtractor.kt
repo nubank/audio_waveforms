@@ -83,6 +83,13 @@ class WaveformExtractor(
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /**
+     * [expectedPoints] floored at 1. It arrives from Flutter and nothing stops
+     * it from being zero, which would make every bucket calculation below
+     * divide by zero.
+     */
+    private val pointCount = max(1, expectedPoints)
+
+    /**
      * Retrieves the audio format from the given media file
      *
      * This method:
@@ -144,8 +151,13 @@ class WaveformExtractor(
                                     codec.queueInputBuffer(index, 0, size, sampleTime, 0)
                                     extractor.advance()
                                 } catch (e: Exception) {
+                                    // Terminal: no end-of-stream buffer was
+                                    // queued, so the codec would never reach
+                                    // EOF and would keep running with its
+                                    // caller already answered.
                                     inputEof = true
                                     submitError(e.message, "Invalid input buffer.")
+                                    stop()
                                 }
                             } else {
                                 codec.queueInputBuffer(
@@ -181,7 +193,7 @@ class WaveformExtractor(
                         // A bucket of zero samples would divide by zero on
                         // every point when more points are asked for than the
                         // clip has samples.
-                        perSamplePoints = max(1L, totalSamples / expectedPoints)
+                        perSamplePoints = max(1L, totalSamples / pointCount)
                     }
 
                     override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
@@ -240,7 +252,7 @@ class WaveformExtractor(
                             // The trailing bucket holds fewer samples than a
                             // full one, so its RMS is averaged over what it
                             // actually got.
-                            if (currentProgress < expectedPoints && sampleCount > 0) {
+                            if (currentProgress < pointCount && sampleCount > 0) {
                                 updateProgress()
                                 sendProgress(sqrt(sampleSum / sampleCount).toFloat())
                             }
@@ -287,7 +299,7 @@ class WaveformExtractor(
             // to do, killed the app: it runs inside the codec's own output
             // callback, and the end-of-stream callback queued behind it then
             // stopped an already released codec.
-            if (currentProgress >= expectedPoints) {
+            if (currentProgress >= pointCount) {
                 sampleCount = 0
                 sampleSum = 0.0
                 return
@@ -379,7 +391,7 @@ class WaveformExtractor(
      */
     private fun updateProgress() {
         currentProgress++
-        progress = currentProgress / expectedPoints
+        progress = currentProgress / pointCount
     }
 
     /**
@@ -398,13 +410,17 @@ class WaveformExtractor(
         sampleSum = 0.0
 
         val args: MutableMap<String, Any?> = HashMap()
-        args[Constants.waveformData] = sampleData
+        // A snapshot: the post below outlives this callback, and the live list
+        // keeps growing until the extraction ends.
+        args[Constants.waveformData] = ArrayList(sampleData)
         args[Constants.progress] = progress
         args[Constants.playerKey] = key
-        methodChannel.invokeMethod(
-            Constants.onCurrentExtractedWaveformData,
-            args
-        )
+        mainHandler.post {
+            methodChannel.invokeMethod(
+                Constants.onCurrentExtractedWaveformData,
+                args
+            )
+        }
     }
 
     /**
