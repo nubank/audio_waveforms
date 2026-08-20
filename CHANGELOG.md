@@ -5,6 +5,7 @@
 - Fixed - Crash with `IllegalStateException` in `MediaCodec.native_stop` while extracting a waveform on Android
 - Fixed - `extractWaveformData` never completing on Android when a clip ends before the requested number of points is produced
 - Fixed - Incorrect 8-bit, 16-bit and float PCM sample decoding on Android
+- Fixed - Recording never finalizing on Android when the encoder is holding an input buffer at the moment `stop` is called, leaving the file without its `moov` box
 
 ## 2.0.2
 

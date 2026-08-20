@@ -153,16 +153,9 @@ class CommonEncoder {
         mediaCodec.setCallback(object : MediaCodec.Callback() {
             override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
                 if (isEncodingComplete && inputQueue.isEmpty()) {
-                    // Use the last calculated presentation time for EOF, not system time
-                    val eofTimestamp = if (totalBytesEncoded > 0) {
-                        val bytesPerSample = 2L
-                        val channels = 1L
-                        (totalBytesEncoded * 1_000_000L) / (recorderSettings.sampleRate * channels * bytesPerSample)
-                    } else {
-                        0L
-                    }
                     codec.queueInputBuffer(
-                        index, 0, 0, eofTimestamp, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                        index, 0, 0, endOfStreamTimestampUs(),
+                        MediaCodec.BUFFER_FLAG_END_OF_STREAM
                     )
                 } else {
                     currentInputBufferIndex = index
@@ -270,12 +263,43 @@ class CommonEncoder {
 
     /**
      * Signals that no more audio data will be provided
-     * 
+     *
      * This method marks the encoding process as complete. Once all queued data
      * is processed, the encoder will be sent an end-of-stream signal.
      */
     fun signalToStop() {
         isEncodingComplete = true
+
+        // End of stream is normally queued from onInputBufferAvailable, but the
+        // codec does not call back for a buffer it has already handed over. By
+        // the time recording stops the input queue is drained and one such
+        // buffer is usually being held, so nothing would ever mark the end of
+        // the stream: the encoder would not finish, the muxer would never write
+        // its `moov` box, and the caller would wait forever for a file that
+        // stays truncated.
+        synchronized(inputQueue) {
+            val index = currentInputBufferIndex
+            if (index < 0 || inputQueue.isNotEmpty()) return
+            currentInputBufferIndex = -1
+            mediaCodec.queueInputBuffer(
+                index, 0, 0, endOfStreamTimestampUs(),
+                MediaCodec.BUFFER_FLAG_END_OF_STREAM
+            )
+        }
+    }
+
+    /**
+     * Presentation timestamp to close the stream with.
+     *
+     * Derived from the audio encoded so far rather than from the clock, so it
+     * stays on the same timeline as every other buffer.
+     */
+    private fun endOfStreamTimestampUs(): Long {
+        if (totalBytesEncoded <= 0) return 0L
+        val bytesPerSample = 2L
+        val channels = 1L
+        return (totalBytesEncoded * 1_000_000L) /
+            (recorderSettings.sampleRate * channels * bytesPerSample)
     }
 
     /**
