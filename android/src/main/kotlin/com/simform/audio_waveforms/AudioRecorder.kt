@@ -135,6 +135,11 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
             )
             wavEncoder?.start(result)
         } else {
+            // A fresh encoder per recording: a codec left behind by a previous
+            // recording keeps its callback bound to the instance it was created
+            // with, so reusing one lets a stale codec write into the state of
+            // the recording that follows it.
+            commonEncoder = CommonEncoder()
             commonEncoder.initCodec(recorderSettings = recorderSettings!!, result = result) {
                 recordingThread?.join()
             }

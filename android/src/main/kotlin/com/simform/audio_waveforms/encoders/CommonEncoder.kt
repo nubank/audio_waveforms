@@ -53,9 +53,19 @@ class CommonEncoder {
 
     /** Queue for audio data waiting to be encoded */
     private val inputQueue = LinkedList<ByteArray>()
-    
-    /** Current available input buffer index (-1 if none available) */
-    private var currentInputBufferIndex = -1
+
+    /**
+     * Input buffer indices the codec handed us that are not filled yet.
+     *
+     * Every index the codec offers has to be given back, otherwise the codec
+     * runs out of input buffers and stops calling onInputBufferAvailable —
+     * which in turn means the end-of-stream buffer can never be queued and
+     * stop() never completes. Guarded by [inputQueue]'s monitor.
+     */
+    private val availableInputBuffers = LinkedList<Int>()
+
+    /** Guards against queueing the end-of-stream buffer more than once */
+    private var isEndOfStreamQueued = false
 
     /** Flag indicating if the muxer has been started */
     private var isMuxerStarted = false
@@ -98,8 +108,9 @@ class CommonEncoder {
         trackIndex = -1
         isEncodingComplete = false
         isEncoderStopped = false
+        isEndOfStreamQueued = false
         inputQueue.clear()
-        currentInputBufferIndex = -1
+        availableInputBuffers.clear()
         totalBytesEncoded = 0L
         firstOutputTimestamp = -1L
         lastOutputTimestamp = 0L
@@ -152,22 +163,11 @@ class CommonEncoder {
 
         mediaCodec.setCallback(object : MediaCodec.Callback() {
             override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-                if (isEncodingComplete && inputQueue.isEmpty()) {
-                    // Use the last calculated presentation time for EOF, not system time
-                    val eofTimestamp = if (totalBytesEncoded > 0) {
-                        val bytesPerSample = 2L
-                        val channels = 1L
-                        (totalBytesEncoded * 1_000_000L) / (recorderSettings.sampleRate * channels * bytesPerSample)
-                    } else {
-                        0L
-                    }
-                    codec.queueInputBuffer(
-                        index, 0, 0, eofTimestamp, MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                    )
-                } else {
-                    currentInputBufferIndex = index
-                    feedEncoder()
+                synchronized(inputQueue) {
+                    availableInputBuffers.add(index)
                 }
+                feedEncoder()
+                queueEndOfStreamIfNeeded()
             }
 
             override fun onOutputBufferAvailable(
@@ -262,10 +262,7 @@ class CommonEncoder {
         synchronized(inputQueue) {
             inputQueue.add(buffer)
         }
-
-        if (currentInputBufferIndex >= 0) {
-            feedEncoder()
-        }
+        feedEncoder()
     }
 
     /**
@@ -276,6 +273,42 @@ class CommonEncoder {
      */
     fun signalToStop() {
         isEncodingComplete = true
+        // The codec may already have handed us every input buffer it owns, in
+        // which case no further onInputBufferAvailable is coming and the
+        // end-of-stream has to be queued right here.
+        queueEndOfStreamIfNeeded()
+    }
+
+    /**
+     * Queues the end-of-stream buffer once every recorded byte has been fed to
+     * the encoder and a free input buffer is at hand.
+     *
+     * This is what eventually makes the codec emit a buffer flagged with
+     * BUFFER_FLAG_END_OF_STREAM, which is what triggers [stopEncoder] and, with
+     * it, the muxer writing the moov atom that makes the file playable.
+     */
+    private fun queueEndOfStreamIfNeeded() {
+        if (isEncoderStopped) return
+
+        synchronized(inputQueue) {
+            if (!isEncodingComplete || isEndOfStreamQueued) return
+            if (inputQueue.isNotEmpty()) return
+            val index = availableInputBuffers.poll() ?: return
+
+            isEndOfStreamQueued = true
+            mediaCodec.queueInputBuffer(
+                index, 0, 0, endOfStreamTimestampUs(), MediaCodec.BUFFER_FLAG_END_OF_STREAM
+            )
+        }
+    }
+
+    /** Presentation time for the end-of-stream buffer, on the audio timeline. */
+    private fun endOfStreamTimestampUs(): Long {
+        if (totalBytesEncoded <= 0) return 0L
+        val bytesPerSample = 2L
+        val channels = 1L
+        return (totalBytesEncoded * 1_000_000L) /
+                (recorderSettings.sampleRate * channels * bytesPerSample)
     }
 
     /**
@@ -300,26 +333,30 @@ class CommonEncoder {
      * represent the actual audio timeline for proper playback and looping.
      */
     private fun feedEncoder() {
+        if (isEncoderStopped) return
+
         synchronized(inputQueue) {
-            if (inputQueue.isEmpty() || currentInputBufferIndex < 0) return
+            while (inputQueue.isNotEmpty() && availableInputBuffers.isNotEmpty() &&
+                !isEndOfStreamQueued
+            ) {
+                val index = availableInputBuffers.peek() ?: return
+                val inputBuffer = mediaCodec.getInputBuffer(index) ?: return
+                val data = inputQueue.poll() ?: return
+                availableInputBuffers.poll()
 
-            val data = inputQueue.poll() ?: return
-            val inputBuffer = mediaCodec.getInputBuffer(currentInputBufferIndex) ?: return
-            inputBuffer.clear()
-            inputBuffer.put(data)
+                inputBuffer.clear()
+                inputBuffer.put(data)
 
-            // Calculate presentation time based on actual audio data encoded
-            // Formula: presentationTimeUs = (totalBytes * 1,000,000) / (sampleRate * channels * bytesPerSample)
-            // For 16-bit PCM mono: bytesPerSample = 2, channels = 1
-            val bytesPerSample = 2L  // 16-bit = 2 bytes
-            val channels = 1L  // Mono
-            val presentationTimeUs = (totalBytesEncoded * 1_000_000L) / (recorderSettings.sampleRate * channels * bytesPerSample)
-            totalBytesEncoded += data.size
-            
-            mediaCodec.queueInputBuffer(
-                currentInputBufferIndex, 0, data.size, presentationTimeUs, 0
-            )
-            currentInputBufferIndex = -1
+                // Calculate presentation time based on actual audio data encoded
+                // Formula: presentationTimeUs = (totalBytes * 1,000,000) / (sampleRate * channels * bytesPerSample)
+                // For 16-bit PCM mono: bytesPerSample = 2, channels = 1
+                val bytesPerSample = 2L  // 16-bit = 2 bytes
+                val channels = 1L  // Mono
+                val presentationTimeUs = (totalBytesEncoded * 1_000_000L) / (recorderSettings.sampleRate * channels * bytesPerSample)
+                totalBytesEncoded += data.size
+
+                mediaCodec.queueInputBuffer(index, 0, data.size, presentationTimeUs, 0)
+            }
         }
     }
 
@@ -420,8 +457,9 @@ class CommonEncoder {
         isMuxerStarted = false
         trackIndex = -1
         isEncodingComplete = false
+        isEndOfStreamQueued = false
         inputQueue.clear()
-        currentInputBufferIndex = -1
+        availableInputBuffers.clear()
         totalBytesEncoded = 0L
         firstOutputTimestamp = -1L
         lastOutputTimestamp = 0L
