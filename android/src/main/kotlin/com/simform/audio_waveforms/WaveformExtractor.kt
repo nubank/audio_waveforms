@@ -6,10 +6,15 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import io.flutter.plugin.common.MethodChannel
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.sqrt
 import androidx.core.net.toUri
@@ -36,8 +41,6 @@ class WaveformExtractor(
     private val methodChannel: MethodChannel,
     /** Result callback for sending the final result back to Flutter */
     private val result: MethodChannel.Result,
-    /** Callback for notifying about progress changes */
-    private val extractorCallBack: ExtractorCallBack,
     /** Application context for accessing content URIs */
     private val context: Context,
 ) {
@@ -67,7 +70,17 @@ class WaveformExtractor(
     /** Number of audio samples per waveform data point */
     private var perSamplePoints = 0L
     /** Flag to prevent submitting multiple results */
-    private var isReplySubmitted = false
+    private val isReplySubmitted = AtomicBoolean(false)
+    /** Flag to keep the teardown idempotent */
+    private val isStopped = AtomicBoolean(false)
+
+    /**
+     * The codec delivers its callbacks on its own looper thread, while
+     * [stop] can also be reached from the platform thread through
+     * `stopExtraction`. A `MethodChannel.Result` has to be answered on the
+     * platform thread, so every reply is posted here.
+     */
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     /**
      * Retrieves the audio format from the given media file
@@ -111,7 +124,7 @@ class WaveformExtractor(
      * 2. Processing input buffers from the MediaExtractor
      * 3. Processing decoded PCM audio data in output buffers
      * 4. Calculating RMS values for waveform visualization
-     * 5. Reporting progress via the callback interface and method channel
+     * 5. Reporting progress over the method channel
      */
     fun startDecode() {
         try {
@@ -132,11 +145,7 @@ class WaveformExtractor(
                                     extractor.advance()
                                 } catch (e: Exception) {
                                     inputEof = true
-                                    result.error(
-                                        Constants.LOG_TAG,
-                                        e.message,
-                                        "Invalid input buffer."
-                                    )
+                                    submitError(e.message, "Invalid input buffer.")
                                 }
                             } else {
                                 codec.queueInputBuffer(
@@ -169,19 +178,18 @@ class WaveformExtractor(
                             16
                         }
                         totalSamples = (sampleRate.toLong() * durationMillis) / 1000
-                        perSamplePoints = totalSamples / expectedPoints
+                        // A bucket of zero samples would divide by zero on
+                        // every point when more points are asked for than the
+                        // clip has samples.
+                        perSamplePoints = max(1L, totalSamples / expectedPoints)
                     }
 
                     override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
-                        if (!isReplySubmitted) {
-                            result.error(
-                                Constants.LOG_TAG,
-                                e.message,
-                                "An error is thrown while decoding the audio file"
-                            )
-                            isReplySubmitted = true
-                            finishCount.countDown()
-                        }
+                        submitError(
+                            e.message,
+                            "An error is thrown while decoding the audio file"
+                        )
+                        stop()
                     }
 
                     override fun onOutputBufferAvailable(
@@ -229,9 +237,13 @@ class WaveformExtractor(
                         }
 
                         if (info.isEof()) {
-                            updateProgress()
-                            val rms = sqrt(sampleSum / perSamplePoints).toFloat()
-                            sendProgress(rms)
+                            // The trailing bucket holds fewer samples than a
+                            // full one, so its RMS is averaged over what it
+                            // actually got.
+                            if (currentProgress < expectedPoints && sampleCount > 0) {
+                                updateProgress()
+                                sendProgress(sqrt(sampleSum / sampleCount).toFloat())
+                            }
                             stop()
                         }
                     }
@@ -241,14 +253,8 @@ class WaveformExtractor(
             }
 
         } catch (e: Exception) {
-            if (!isReplySubmitted) {
-                result.error(
-                    Constants.LOG_TAG,
-                    e.message,
-                    "An error is thrown before decoding the audio file"
-                )
-                isReplySubmitted = true
-            }
+            submitError(e.message, "An error is thrown before decoding the audio file")
+            stop()
         }
 
 
@@ -273,13 +279,20 @@ class WaveformExtractor(
      */
     private fun handleBufferDivision(value: Float) {
         if (sampleCount == perSamplePoints) {
-            updateProgress()
-
-            // Discard redundant values and release resources
-            if (progress > 1.0F) {
-                stop()
+            // A decoder emits more frames than the container's declared
+            // duration implies — an AAC encoder delay alone is 2048 frames —
+            // so the buckets run out before the stream does. Those trailing
+            // frames are padding: drop them instead of emitting a point that
+            // was never asked for. Tearing the codec down here, as this used
+            // to do, killed the app: it runs inside the codec's own output
+            // callback, and the end-of-stream callback queued behind it then
+            // stopped an already released codec.
+            if (currentProgress >= expectedPoints) {
+                sampleCount = 0
+                sampleSum = 0.0
                 return
             }
+            updateProgress()
             val rms = sqrt(sampleSum / perSamplePoints).toFloat()
             sendProgress(rms)
         }
@@ -299,7 +312,10 @@ class WaveformExtractor(
      */
     private fun handle8bit(size: Int, buf: ByteBuffer) {
         repeat(size / if (channels == 2) 2 else 1) {
-            val result = buf.get().toInt() / Constants.EIGHT_BITS
+            // ENCODING_PCM_8BIT is unsigned, with 128 as silence, but a Kotlin
+            // Byte is signed: it has to be widened before being centered.
+            val sample = (buf.get().toInt() and 0xFF) - 128
+            val result = sample / Constants.EIGHT_BITS
             if (channels == 2) {
                 buf.get()
             }
@@ -318,9 +334,13 @@ class WaveformExtractor(
      */
     private fun handle16bit(size: Int, buf: ByteBuffer) {
         repeat(size / if (channels == 2) 4 else 2) {
-            val first = buf.get().toInt()
-            val second = buf.get().toInt() shl 8
-            val value = (first or second) / Constants.SIXTEEN_BITS
+            // Little endian: low byte first. It has to be masked, or a Kotlin
+            // Byte over 0x7F widens to a negative Int and its sign bits
+            // swallow the high byte, turning the sample into noise. The high
+            // byte is left signed on purpose — that is the sample's own sign.
+            val low = buf.get().toInt() and 0xFF
+            val high = buf.get().toInt() shl 8
+            val value = (low or high) / Constants.SIXTEEN_BITS
             if (channels == 2) {
                 buf.get()
                 buf.get()
@@ -332,24 +352,20 @@ class WaveformExtractor(
     /**
      * Processes 32-bit PCM audio data
      *
-     * Reads 32-bit samples from the buffer, normalizes them to the range [-1.0, 1.0],
-     * and passes them to handleBufferDivision for RMS calculation.
-     * 
+     * A 32-bit bit depth is only ever set for `ENCODING_PCM_FLOAT`, so the
+     * buffer holds IEEE-754 floats already normalized to [-1.0, 1.0]. Reading
+     * them as a 32-bit integer, as this used to do, reinterprets the exponent
+     * bits as magnitude and yields noise.
+     *
      * @param size Size of the buffer in bytes
      * @param buf ByteBuffer containing the audio data
      */
     private fun handle32bit(size: Int, buf: ByteBuffer) {
+        val floats = buf.order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         repeat(size / if (channels == 2) 8 else 4) {
-            val first = buf.get().toLong()
-            val second = buf.get().toLong() shl 8
-            val third = buf.get().toLong() shl 16
-            val forth = buf.get().toLong() shl 24
-            val value = (first or second or third or forth) / Constants.THIRTY_TWO_BITS
+            val value = floats.get()
             if (channels == 2) {
-                buf.get()
-                buf.get()
-                buf.get()
-                buf.get()
+                floats.get()
             }
             handleBufferDivision(value)
         }
@@ -371,15 +387,13 @@ class WaveformExtractor(
      *
      * This method:
      * 1. Adds the new RMS value to the waveform data
-     * 2. Reports the progress via the callback interface
-     * 3. Resets the sample counters for the next data point
-     * 4. Sends the current waveform data and progress to Flutter via the method channel
+     * 2. Resets the sample counters for the next data point
+     * 3. Sends the current waveform data and progress to Flutter via the method channel
      * 
      * @param rms The calculated RMS value for this data point
      */
     private fun sendProgress(rms: Float) {
         sampleData.add(rms)
-        extractorCallBack.onProgress(progress)
         sampleCount = 0
         sampleSum = 0.0
 
@@ -394,18 +408,42 @@ class WaveformExtractor(
     }
 
     /**
-     * Stops the extraction process and releases resources
+     * Stops the extraction process, releases resources and answers Flutter
+     * with whatever was collected.
      *
-     * This method:
-     * 1. Stops and releases the MediaCodec decoder
-     * 2. Releases the MediaExtractor
-     * 3. Signals completion via the countdown latch
+     * Reachable both from the codec's end-of-stream callback and from
+     * `stopExtraction` on the platform thread, so it is idempotent: a second
+     * call would otherwise stop an already released `MediaCodec` and take the
+     * app down with an `IllegalStateException`. Answering here as well is what
+     * keeps a cancelled — or short — extraction from leaving its caller
+     * waiting forever.
      */
     fun stop() {
-        decoder?.stop()
-        decoder?.release()
+        if (!isStopped.compareAndSet(false, true)) return
+        try {
+            decoder?.stop()
+            decoder?.release()
+        } catch (e: IllegalStateException) {
+            Log.e(Constants.LOG_TAG, "Error releasing the decoder: ${e.message}")
+        }
+        decoder = null
         extractor?.release()
+        extractor = null
+        submitSuccess()
         finishCount.countDown()
+    }
+
+    /** Answers Flutter with the collected points, once. */
+    private fun submitSuccess() {
+        if (!isReplySubmitted.compareAndSet(false, true)) return
+        val data = ArrayList(sampleData)
+        mainHandler.post { result.success(data) }
+    }
+
+    /** Answers Flutter with an error, once. */
+    private fun submitError(message: String?, details: String) {
+        if (!isReplySubmitted.compareAndSet(false, true)) return
+        mainHandler.post { result.error(Constants.LOG_TAG, message, details) }
     }
 }
 
@@ -415,18 +453,3 @@ class WaveformExtractor(
  * @return true if this buffer marks the end of the stream, false otherwise
  */
 fun MediaCodec.BufferInfo.isEof() = flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-
-/**
- * Callback interface for reporting waveform extraction progress
- * 
- * Implementations of this interface receive progress updates during
- * the waveform extraction process.
- */
-interface ExtractorCallBack {
-    /**
-     * Called when extraction progress changes
-     * 
-     * @param value Progress value from 0.0 to 1.0, where 1.0 indicates completion
-     */
-    fun onProgress(value: Float)
-}
