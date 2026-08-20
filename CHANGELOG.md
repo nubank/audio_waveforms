@@ -2,6 +2,9 @@
 
 - Feature [#468](https://github.com/SimformSolutionsPvtLtd/audio_waveforms/pull/468) - Add macOS support
 - Chore [#509](https://github.com/SimformSolutionsPvtLtd/audio_waveforms/issues/509) - Migrate Android playback from ExoPlayer 2.17.1 to Media3 1.11.0
+- Fixed - Crash with `IllegalStateException` in `MediaCodec.native_stop` while extracting a waveform on Android
+- Fixed - `extractWaveformData` never completing on Android when a clip ends before the requested number of points is produced
+- Fixed - Incorrect 8-bit, 16-bit and float PCM sample decoding on Android
 
 ## 2.0.2
 
